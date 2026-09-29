@@ -11,7 +11,7 @@ from google.genai.errors import APIError
 # CẤU HÌNH GIAO DIỆN STREAMLIT (Trắng - Đen)
 # ==========================================
 st.set_page_config(
-    page_title="Công Cụ Dịch Sót Tiếng Trung",
+    page_title="Công Cụ Sửa Chữ Trung Sót",
     page_icon="📖",
     layout="wide"
 )
@@ -49,21 +49,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 MODEL_NAME = "gemini-3.6-flash"
-CHINESE_REGEX = re.compile(r"[\u4e00-\u9fa5]")
+CHINESE_REGEX = re.compile(r"[\u4e00-\u9fa5]+")
 
-def contains_chinese(text: str) -> bool:
-    return bool(CHINESE_REGEX.search(text))
+def extract_chinese_words(text: str) -> list[str]:
+    """Trích xuất tất cả các từ/cụm từ tiếng Trung có trong đoạn văn."""
+    return list(set(CHINESE_REGEX.findall(text)))
 
-def translate_batch_with_retry(texts: list[str], api_keys: list[str], current_key_idx: list[int], log_area) -> tuple[list[str], int]:
-    # Prompt cải tiến rõ ràng hơn
+def translate_terms(terms: list[str], api_keys: list[str], current_key_idx: list[int], log_area) -> dict[str, str]:
+    """Gửi danh sách các từ tiếng Trung bị sót để Gemini dịch sang tiếng Việt."""
     prompt = (
-        "Bạn là dịch giả tiểu thuyết chuyên nghiệp. Hãy dịch các đoạn văn bản tiếng Trung "
-        "dưới đây sang tiếng Việt mượt mà, văn phong tiểu thuyết.\n"
-        "YÊU CẦU ĐỊNH DẠNG TRẢ VỀ:\n"
-        "Mỗi đoạn dịch trả về đúng trên 1 dòng riêng biệt theo thứ tự. Bắt đầu mỗi dòng bằng '[DICH]: '\n\n"
+        "Bạn là dịch giả tiểu thuyết. Hãy dịch chính xác các từ/cụm từ tiếng Trung dưới đây sang tiếng Việt "
+        "(chuẩn Hán Việt hoặc ngữ cảnh tiểu thuyết).\n"
+        "ĐỊNH DẠNG TRẢ VỀ CHÍNH XÁC:\n"
+        "Mỗi từ dịch nằm trên 1 dòng theo dạng: 'từ_tiếng_trung -> từ_tiếng_việt'\n"
+        "Ví dụ: 'Nam Sủng -> Nam Sủng'\n\n"
+        "Danh sách từ cần dịch:\n"
     )
-    for idx, t in enumerate(texts, 1):
-        prompt += f"Đoạn {idx}: {t}\n"
+    for t in terms:
+        prompt += f"- {t}\n"
 
     max_attempts = len(api_keys) * 2
 
@@ -76,164 +79,188 @@ def translate_batch_with_retry(texts: list[str], api_keys: list[str], current_ke
                 model=MODEL_NAME,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.3,
+                    temperature=0.1,
                 ),
             )
 
             raw_text = response.text.strip() if response.text else ""
-            lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+            mapping = {}
+            for line in raw_text.split("\n"):
+                if "->" in line:
+                    parts = line.split("->", 1)
+                    cn_word = parts[0].replace("-", "").strip()
+                    vi_word = parts[1].strip()
+                    if cn_word and vi_word:
+                        mapping[cn_word] = vi_word
 
-            # Tách dòng có tiền tố [DICH]:
-            translated_lines = []
-            for line in lines:
-                if "[DICH]:" in line:
-                    translated_lines.append(line.split("[DICH]:", 1)[1].strip())
-                elif re.match(r"^Đoạn \d+:", line):
-                    # Dự phòng trường hợp Gemini tự đổi [DICH]: thành Đoạn X:
-                    translated_lines.append(re.sub(r"^Đoạn \d+:\s*", "", line).strip())
-
-            # Nếu lấy đúng số đoạn
-            if len(translated_lines) == len(texts):
-                return translated_lines, key_idx
-            
-            # Nếu Gemini trả về số dòng thuần khớp đúng số đoạn
-            if len(lines) == len(texts):
-                cleaned_lines = [re.sub(r"^(\[DICH\]:|Đoạn \d+:)\s*", "", l) for l in lines]
-                return cleaned_lines, key_idx
-
-            log_area.warning(f"⚠️ Key #{key_idx + 1}: Trả về {len(translated_lines)}/{len(texts)} đoạn. Đang thử lại...")
+            if mapping:
+                return mapping, key_idx
 
         except APIError as e:
-            log_area.error(f"⚠️ Key #{key_idx + 1} lỗi API: {e}")
+            log_area.warning(f"⚠️ Key #{key_idx + 1} gặp lỗi API. Đang tự động đổi Key...")
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
-            log_area.info(f"🔄 Đã chuyển sang Key #{current_key_idx[0] + 1}")
-            time.sleep(2)
-        except Exception as e:
-            log_area.error(f"⚠️ Lỗi không xác định: {e}")
+            time.sleep(1)
+        except Exception:
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
-            time.sleep(3)
+            time.sleep(1)
 
-    log_area.error("❌ Không thể dịch batch này sau khi thử tất cả Keys. Giữ nguyên văn bản gốc.")
-    return texts, current_key_idx[0]
+    return {}, current_key_idx[0]
 
 # ==========================================
 # GIAO DIỆN NGƯỜI DÙNG
 # ==========================================
-st.title("📖 Tool Dịch Sót Tiếng Trung (Gemini 3.6 Flash)")
-st.caption("Giao diện Đen - Trắng tối giản, tự động xoay vòng API Keys")
+st.title("📖 Tool Sửa Từ Tiếng Trung Sót (Gemini 3.6 Flash)")
+st.caption("Giữ nguyên 100% câu chữ tiếng Việt gốc, chỉ dịch và thay thế đúng các chữ Trung bị sót.")
 
 st.divider()
 
 # Sidebar: Cấu hình API Keys & Thông số
 with st.sidebar:
     st.header("⚙️ Cấu hình API Keys")
-    st.info("Nhập 3-4 API Keys (dạng AQ.Ab...) từ các Project khác nhau, mỗi key trên 1 dòng:")
+    st.info("Nhập các API Keys (dạng AQ.Ab...), mỗi key trên 1 dòng:")
     
-    keys_input = st.text_area("Danh sách API Keys", value="", height=150, placeholder="AQ.Ab...\nAQ.Ab...\nAQ.Ab...")
-    api_keys = [k.strip() for k in keys_input.split("\n") if k.strip()]
+    keys_input = st.text_area("Danh sách API Keys", value="", height=180, placeholder="AQ.Ab...\nAQ.Ab...\nAQ.Ab...")
+    api_keys = [k.strip() for k in keys_input.split() if k.strip().startswith("AQ.Ab")]
 
     st.header("🎛️ Tùy chỉnh tham số")
-    batch_size = st.number_input("Số đoạn / Batch", min_value=1, max_value=20, value=3)  # Giảm xuống 3 đoạn để tránh lỗi format
-    delay_time = st.number_input("Thời gian chờ giữa các Batch (giây)", min_value=0, max_value=30, value=5)
+    batch_terms_count = st.number_input("Số từ gom dịch / 1 lần gọi", min_value=5, max_value=50, value=20)
+    delay_time = st.number_input("Thời gian nghỉ (giây)", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
 
 # Main Content: Upload file
 uploaded_file = st.file_uploader("Tải lên file Word (.docx) hoặc File văn bản (.txt)", type=["docx", "txt"])
 
-if uploaded_file and api_keys:
-    file_type = uploaded_file.name.split(".")[-1].lower()
-    
-    if st.button("🚀 Bắt đầu xử lý dịch sót"):
-        log_area = st.empty()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+if uploaded_file:
+    if not api_keys:
+        st.warning("⚠️ Vui lòng nhập ít nhất 1 API Key hợp lệ ở thanh bên trái!")
+    else:
+        file_type = uploaded_file.name.split(".")[-1].lower()
         
-        current_key_idx = [0]
-        output_buffer = io.BytesIO()
-
-        if file_type == "docx":
-            doc = Document(uploaded_file)
-            target_paragraphs = [p for p in doc.paragraphs if p.text and contains_chinese(p.text)]
-            total_found = len(target_paragraphs)
-
-            if total_found == 0:
-                st.success("✅ File Word không có đoạn nào chứa tiếng Trung!")
-            else:
-                st.info(f"🎯 Phát hiện {total_found} đoạn văn còn sót tiếng Trung.")
-                
-                total_batches = (total_found + batch_size - 1) // batch_size
-                
-                for i in range(0, total_found, batch_size):
-                    batch_paras = target_paragraphs[i : i + batch_size]
-                    batch_texts = [p.text for p in batch_paras]
-                    current_batch_num = (i // batch_size) + 1
-
-                    status_text.text(f"🔄 Đang xử lý Batch {current_batch_num}/{total_batches} với Key #{current_key_idx[0] + 1}...")
-
-                    translated_texts, new_key_idx = translate_batch_with_retry(
-                        batch_texts, api_keys, current_key_idx, log_area
-                    )
-                    current_key_idx[0] = new_key_idx
-
-                    for p, translated in zip(batch_paras, translated_texts):
-                        p.text = translated
-
-                    progress_bar.progress(current_batch_num / total_batches)
-
-                    if i + batch_size < total_found:
-                        time.sleep(delay_time)
-
-                doc.save(output_buffer)
-                output_buffer.seek(0)
-                
-                st.success("🎉 Hoàn tất dịch!")
-                
-                st.download_button(
-                    label="📥 Tải về File Word Đã Dịch (.docx)",
-                    data=output_buffer,
-                    file_name=f"dich_{uploaded_file.name}",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-
-        elif file_type == "txt":
-            content = uploaded_file.read().decode("utf-8")
-            lines = content.split("\n")
+        if st.button("🚀 Bắt đầu quét & sửa chữ sót"):
+            log_area = st.empty()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            target_indices = [idx for idx, line in enumerate(lines) if line and contains_chinese(line)]
-            total_found = len(target_indices)
+            current_key_idx = [0]
+            output_buffer = io.BytesIO()
 
-            if total_found == 0:
-                st.success("✅ File TXT không có đoạn nào chứa tiếng Trung!")
-            else:
-                st.info(f"🎯 Phát hiện {total_found} dòng còn sót tiếng Trung.")
-                total_batches = (total_found + batch_size - 1) // batch_size
+            if file_type == "docx":
+                doc = Document(uploaded_file)
+                
+                # BƯỚC 1: Quét toàn bộ từ tiếng Trung bị sót trong file
+                all_chinese_terms = set()
+                target_paragraphs = []
+                for p in doc.paragraphs:
+                    if p.text:
+                        terms = extract_chinese_words(p.text)
+                        if terms:
+                            target_paragraphs.append(p)
+                            all_chinese_terms.update(terms)
 
-                for i in range(0, total_found, batch_size):
-                    batch_indices = target_indices[i : i + batch_size]
-                    batch_texts = [lines[idx] for idx in batch_indices]
-                    current_batch_num = (i // batch_size) + 1
+                unique_terms = list(all_chinese_terms)
+                total_terms = len(unique_terms)
 
-                    status_text.text(f"🔄 Đang xử lý Batch {current_batch_num}/{total_batches}...")
+                if total_terms == 0:
+                    st.success("✅ File Word hoàn toàn sạch sẽ, không có chữ Trung nào bị sót!")
+                else:
+                    st.info(f"🎯 Phát hiện {total_terms} từ/cụm từ tiếng Trung bị dính rải rác trong {len(target_paragraphs)} đoạn.")
+                    
+                    # BƯỚC 2: Gom các từ tiếng Trung gửi Gemini dịch sang tiếng Việt
+                    translation_dict = {}
+                    total_batches = (total_terms + batch_terms_count - 1) // batch_terms_count
 
-                    translated_texts, new_key_idx = translate_batch_with_retry(
-                        batch_texts, api_keys, current_key_idx, log_area
+                    for i in range(0, total_terms, batch_terms_count):
+                        batch_terms = unique_terms[i : i + batch_terms_count]
+                        current_batch_num = (i // batch_terms_count) + 1
+
+                        status_text.text(f"🔄 Đang dịch cụm từ đợt {current_batch_num}/{total_batches} bằng Key #{current_key_idx[0] + 1}...")
+
+                        mapping, new_key_idx = translate_terms(
+                            batch_terms, api_keys, current_key_idx, log_area
+                        )
+                        current_key_idx[0] = new_key_idx
+                        translation_dict.update(mapping)
+
+                        progress_bar.progress(current_batch_num / total_batches)
+
+                        if delay_time > 0 and i + batch_terms_count < total_terms:
+                            time.sleep(delay_time)
+
+                    # BƯỚC 3: Thay thế các từ đã dịch trực tiếp vào đúng vị trí cũ trong đoạn
+                    for p in target_paragraphs:
+                        text_content = p.text
+                        for cn_word, vi_word in translation_dict.items():
+                            if cn_word in text_content:
+                                text_content = text_content.replace(cn_word, vi_word)
+                        p.text = text_content
+
+                    doc.save(output_buffer)
+                    output_buffer.seek(0)
+                    
+                    st.success("🎉 Hoàn tất! Đã thay thế sạch sẽ tất cả chữ Trung bị sót.")
+                    
+                    st.download_button(
+                        label="📥 Tải về File Word Đã Sửa (.docx)",
+                        data=output_buffer,
+                        file_name=f"da_sua_{uploaded_file.name}",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     )
-                    current_key_idx[0] = new_key_idx
 
-                    for idx, translated in zip(batch_indices, translated_texts):
-                        lines[idx] = translated
-
-                    progress_bar.progress(current_batch_num / total_batches)
-
-                    if i + batch_size < total_found:
-                        time.sleep(delay_time)
-
-                result_txt = "\n".join(lines)
+            elif file_type == "txt":
+                content = uploaded_file.read().decode("utf-8")
+                lines = content.split("\n")
                 
-                st.success("🎉 Hoàn tất dịch!")
-                
-                st.download_button(
-                    label="📥 Tải về File TXT Đã Dịch (.txt)",
-                    data=result_txt,
-                    file_name=f"dich_{uploaded_file.name}",
-                    mime="text/plain"
-                )
+                all_chinese_terms = set()
+                target_indices = []
+                for idx, line in enumerate(lines):
+                    if line:
+                        terms = extract_chinese_words(line)
+                        if terms:
+                            target_indices.append(idx)
+                            all_chinese_terms.update(terms)
+
+                unique_terms = list(all_chinese_terms)
+                total_terms = len(unique_terms)
+
+                if total_terms == 0:
+                    st.success("✅ File TXT hoàn toàn sạch sẽ, không có chữ Trung bị sót!")
+                else:
+                    st.info(f"🎯 Phát hiện {total_terms} từ/cụm từ tiếng Trung rải rác.")
+                    
+                    translation_dict = {}
+                    total_batches = (total_terms + batch_terms_count - 1) // batch_terms_count
+
+                    for i in range(0, total_terms, batch_terms_count):
+                        batch_terms = unique_terms[i : i + batch_terms_count]
+                        current_batch_num = (i // batch_terms_count) + 1
+
+                        status_text.text(f"🔄 Đang dịch đợt {current_batch_num}/{total_batches} bằng Key #{current_key_idx[0] + 1}...")
+
+                        mapping, new_key_idx = translate_terms(
+                            batch_terms, api_keys, current_key_idx, log_area
+                        )
+                        current_key_idx[0] = new_key_idx
+                        translation_dict.update(mapping)
+
+                        progress_bar.progress(current_batch_num / total_batches)
+
+                        if delay_time > 0 and i + batch_terms_count < total_terms:
+                            time.sleep(delay_time)
+
+                    # Thay thế trực tiếp vào dòng
+                    for idx in target_indices:
+                        line_content = lines[idx]
+                        for cn_word, vi_word in translation_dict.items():
+                            if cn_word in line_content:
+                                line_content = line_content.replace(cn_word, vi_word)
+                        lines[idx] = line_content
+
+                    result_txt = "\n".join(lines)
+                    
+                    st.success("🎉 Hoàn tất! Đã thay thế sạch sẽ tất cả chữ Trung bị sót.")
+                    
+                    st.download_button(
+                        label="📥 Tải về File TXT Đã Sửa (.txt)",
+                        data=result_txt,
+                        file_name=f"da_sua_{uploaded_file.name}",
+                        mime="text/plain"
+                    )
