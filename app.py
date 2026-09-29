@@ -16,7 +16,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS giao diện Đen - Trắng (Dark Theme Minimalist)
 st.markdown("""
     <style>
     .stApp {
@@ -56,11 +55,12 @@ def contains_chinese(text: str) -> bool:
     return bool(CHINESE_REGEX.search(text))
 
 def translate_batch_with_retry(texts: list[str], api_keys: list[str], current_key_idx: list[int], log_area) -> tuple[list[str], int]:
+    # Prompt cải tiến rõ ràng hơn
     prompt = (
-        "Bạn là một dịch giả tiểu thuyết chuyên nghiệp. Hãy dịch các đoạn văn bản tiếng Trung "
+        "Bạn là dịch giả tiểu thuyết chuyên nghiệp. Hãy dịch các đoạn văn bản tiếng Trung "
         "dưới đây sang tiếng Việt mượt mà, văn phong tiểu thuyết.\n"
-        "CUNG CẤP ĐÚNG ĐỊNH DẠNG: Trả về chính xác danh sách các đoạn dịch, mỗi đoạn nằm trên một dòng "
-        "và bắt đầu bằng tiền tố '[DICH]: '. Không thêm lời mở đầu hay kết luận.\n\n"
+        "YÊU CẦU ĐỊNH DẠNG TRẢ VỀ:\n"
+        "Mỗi đoạn dịch trả về đúng trên 1 dòng riêng biệt theo thứ tự. Bắt đầu mỗi dòng bằng '[DICH]: '\n\n"
     )
     for idx, t in enumerate(texts, 1):
         prompt += f"Đoạn {idx}: {t}\n"
@@ -80,29 +80,40 @@ def translate_batch_with_retry(texts: list[str], api_keys: list[str], current_ke
                 ),
             )
 
-            lines = response.text.strip().split("\n")
-            translated_lines = [
-                line.replace("[DICH]:", "").strip()
-                for line in lines
-                if line.startswith("[DICH]:")
-            ]
+            raw_text = response.text.strip() if response.text else ""
+            lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
 
+            # Tách dòng có tiền tố [DICH]:
+            translated_lines = []
+            for line in lines:
+                if "[DICH]:" in line:
+                    translated_lines.append(line.split("[DICH]:", 1)[1].strip())
+                elif re.match(r"^Đoạn \d+:", line):
+                    # Dự phòng trường hợp Gemini tự đổi [DICH]: thành Đoạn X:
+                    translated_lines.append(re.sub(r"^Đoạn \d+:\s*", "", line).strip())
+
+            # Nếu lấy đúng số đoạn
             if len(translated_lines) == len(texts):
                 return translated_lines, key_idx
-            else:
-                log_area.warning(f"⚠️ Số đoạn trả về không khớp ({len(translated_lines)}/{len(texts)}). Đang thử lại...")
+            
+            # Nếu Gemini trả về số dòng thuần khớp đúng số đoạn
+            if len(lines) == len(texts):
+                cleaned_lines = [re.sub(r"^(\[DICH\]:|Đoạn \d+:)\s*", "", l) for l in lines]
+                return cleaned_lines, key_idx
+
+            log_area.warning(f"⚠️ Key #{key_idx + 1}: Trả về {len(translated_lines)}/{len(texts)} đoạn. Đang thử lại...")
 
         except APIError as e:
-            log_area.error(f"⚠️ Key #{key_idx + 1} gặp lỗi API: {e.code if hasattr(e, 'code') else e}")
+            log_area.error(f"⚠️ Key #{key_idx + 1} lỗi API: {e}")
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
-            log_area.info(f"🔄 Đã tự động chuyển sang Key #{current_key_idx[0] + 1}")
+            log_area.info(f"🔄 Đã chuyển sang Key #{current_key_idx[0] + 1}")
             time.sleep(2)
         except Exception as e:
             log_area.error(f"⚠️ Lỗi không xác định: {e}")
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
             time.sleep(3)
 
-    log_area.error("❌ Không thể dịch batch này sau khi thử tất cả Keys. Giữ nguyên gốc.")
+    log_area.error("❌ Không thể dịch batch này sau khi thử tất cả Keys. Giữ nguyên văn bản gốc.")
     return texts, current_key_idx[0]
 
 # ==========================================
@@ -118,13 +129,11 @@ with st.sidebar:
     st.header("⚙️ Cấu hình API Keys")
     st.info("Nhập 3-4 API Keys (dạng AQ.Ab...) từ các Project khác nhau, mỗi key trên 1 dòng:")
     
-    default_keys = ""
-    
-    keys_input = st.text_area("Danh sách API Keys", value=default_keys, height=150)
+    keys_input = st.text_area("Danh sách API Keys", value="", height=150, placeholder="AQ.Ab...\nAQ.Ab...\nAQ.Ab...")
     api_keys = [k.strip() for k in keys_input.split("\n") if k.strip()]
 
     st.header("🎛️ Tùy chỉnh tham số")
-    batch_size = st.number_input("Số đoạn / Batch", min_value=1, max_value=20, value=5)
+    batch_size = st.number_input("Số đoạn / Batch", min_value=1, max_value=20, value=3)  # Giảm xuống 3 đoạn để tránh lỗi format
     delay_time = st.number_input("Thời gian chờ giữa các Batch (giây)", min_value=0, max_value=30, value=5)
 
 # Main Content: Upload file
@@ -178,7 +187,6 @@ if uploaded_file and api_keys:
                 
                 st.success("🎉 Hoàn tất dịch!")
                 
-                # Nút tải về sáng lên sau khi hoàn thành
                 st.download_button(
                     label="📥 Tải về File Word Đã Dịch (.docx)",
                     data=output_buffer,
@@ -223,7 +231,6 @@ if uploaded_file and api_keys:
                 
                 st.success("🎉 Hoàn tất dịch!")
                 
-                # Nút tải về sáng lên sau khi hoàn thành
                 st.download_button(
                     label="📥 Tải về File TXT Đã Dịch (.txt)",
                     data=result_txt,
