@@ -119,7 +119,6 @@ with st.sidebar:
     st.info("Nhập 3-4 API Keys (dạng AQ.Ab...) từ các Project khác nhau, mỗi key trên 1 dòng:")
     
     default_keys = ""
-    )
     
     keys_input = st.text_area("Danh sách API Keys", value=default_keys, height=150)
     api_keys = [k.strip() for k in keys_input.split("\n") if k.strip()]
