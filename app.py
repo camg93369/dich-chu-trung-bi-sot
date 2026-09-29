@@ -17,12 +17,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS: Ép ô Textarea hiển thị nguyên 1 HÀNG NGANG + Bật thanh cuộn ngang
+# Custom CSS: Hiển thị tự động ngắt dòng đẹp mắt cho API Key
 st.markdown("""
     <style>
     [data-testid="stSidebar"] {
-        min-width: 450px !important;
-        max-width: 450px !important;
+        min-width: 420px !important;
+        max-width: 420px !important;
     }
     .stApp {
         background-color: #0e1117;
@@ -52,11 +52,9 @@ st.markdown("""
         color: #ffffff;
     }
     
-    /* Ép ô nhập API Key hiển thị trên 1 dòng duy nhất và có thanh cuộn ngang */
+    /* Cho phép chữ ngắt dòng bình thường để thấy trọn vẹn Key */
     textarea[aria-label="Danh sách API Keys"] {
-        white-space: pre !important;
-        word-wrap: normal !important;
-        overflow-x: auto !important;
+        word-break: break-all !important;
         font-family: monospace !important;
     }
     </style>
@@ -66,11 +64,9 @@ MODEL_NAME = "gemini-3.6-flash"
 CHINESE_REGEX = re.compile(r"[\u4e00-\u9fa5]+")
 
 def extract_chinese_words(text: str) -> list[str]:
-    """Lọc các cụm từ tiếng Trung dính trong đoạn."""
     return list(set(CHINESE_REGEX.findall(text)))
 
 def translate_terms(terms: list[str], api_keys: list[str], current_key_idx: list[int], log_area) -> tuple[dict[str, str], int]:
-    """Gửi danh sách cụm từ tiếng Trung cho Gemini dịch."""
     sample_json = json.dumps({terms[0]: "dịch_việt"}, ensure_ascii=False) if terms else "{}"
     
     prompt = (
@@ -81,7 +77,7 @@ def translate_terms(terms: list[str], api_keys: list[str], current_key_idx: list
         "Danh sách từ cần dịch:\n" + "\n".join(terms)
     )
 
-    max_attempts = len(api_keys) * 2
+    max_attempts = len(api_keys) * 3
 
     for attempt in range(1, max_attempts + 1):
         key_idx = current_key_idx[0]
@@ -98,18 +94,15 @@ def translate_terms(terms: list[str], api_keys: list[str], current_key_idx: list
             )
 
             raw_text = response.text.strip() if response.text else ""
-            # Xóa các ký tự markdown bọc JSON
             raw_text = re.sub(r"^```json\s*", "", raw_text, flags=re.IGNORECASE)
             raw_text = re.sub(r"^```\s*", "", raw_text)
             raw_text = re.sub(r"\s*```$", "", raw_text).strip()
 
-            # Thử parse JSON
             try:
                 mapping = json.loads(raw_text)
                 if isinstance(mapping, dict) and len(mapping) > 0:
                     return mapping, key_idx
             except json.JSONDecodeError:
-                # Nếu không phải JSON, bóc tách bằng regex
                 mapping = {}
                 for line in raw_text.split("\n"):
                     if ":" in line or "->" in line:
@@ -122,16 +115,21 @@ def translate_terms(terms: list[str], api_keys: list[str], current_key_idx: list
                 if len(mapping) > 0:
                     return mapping, key_idx
 
-            log_area.warning(f"⚠️ Key #{key_idx + 1}: Trả về chưa đúng định dạng. Đang thử lại...")
+            log_area.warning(f"⚠️ Key #{key_idx + 1}: Format trả về chưa đúng, đang thử lại...")
 
         except APIError as e:
-            log_area.warning(f"⚠️ Key #{key_idx + 1} báo lỗi API ({e.code if hasattr(e, 'code') else e}). Tự động đổi Key...")
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                log_area.warning(f"⚠️ Key #{key_idx + 1} chạm giới hạn (Lỗi 429). Đang chờ 5 giây và chuyển Key #{((key_idx + 1) % len(api_keys)) + 1}...")
+                time.sleep(5)
+            else:
+                log_area.warning(f"⚠️ Key #{key_idx + 1} báo lỗi API. Đang đổi sang Key tiếp theo...")
+                time.sleep(2)
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
-            time.sleep(1)
         except Exception as e:
-            log_area.warning(f"⚠️ Key #{key_idx + 1} gặp sự cố: {e}. Tự động đổi Key...")
+            log_area.warning(f"⚠️ Sự cố kết nối Key #{key_idx + 1}. Đang tự động đổi Key...")
             current_key_idx[0] = (current_key_idx[0] + 1) % len(api_keys)
-            time.sleep(1)
+            time.sleep(2)
 
     return {}, current_key_idx[0]
 
@@ -149,19 +147,19 @@ with st.sidebar:
     st.info("Nhập các API Keys (dạng AQ.Ab...), mỗi key trên 1 dòng:")
     
     keys_input = st.text_area("Danh sách API Keys", value="", height=200, placeholder="AQ.Ab...\nAQ.Ab...\nAQ.Ab...")
-    # Tự động lọc danh sách Key
-    api_keys = [k.strip() for k in keys_input.split("\n") if k.strip()]
+    # Lọc và làm sạch danh sách Key chuẩn 100%
+    api_keys = [k.strip() for k in keys_input.split() if k.strip()]
 
     st.header("🎛️ Tùy chỉnh tham số")
     batch_terms_count = st.number_input("Số từ gom dịch / 1 lần gọi", min_value=5, max_value=50, value=20)
-    delay_time = st.number_input("Thời gian nghỉ (giây)", min_value=0.0, max_value=10.0, value=1.0, step=0.5)
+    delay_time = st.number_input("Thời gian nghỉ giữa các đợt (giây)", min_value=1.0, max_value=15.0, value=3.0, step=0.5)
 
 # Main Content: Upload file
 uploaded_file = st.file_uploader("Tải lên file Word (.docx) hoặc File văn bản (.txt)", type=["docx", "txt"])
 
 if uploaded_file:
     if not api_keys:
-        st.warning("⚠️ Vui lòng nhập ít nhất 1 API Key hợp lệ ở thanh bên trái!")
+        st.warning("⚠️ Vui lòng nhập ít nhất 1 API Key ở thanh bên trái!")
     else:
         file_type = uploaded_file.name.split(".")[-1].lower()
         
@@ -191,7 +189,7 @@ if uploaded_file:
                 if total_terms == 0:
                     st.success("✅ File Word hoàn toàn sạch sẽ, không có chữ Trung nào bị sót!")
                 else:
-                    st.info(f"🎯 Phát hiện {total_terms} từ/cụm từ tiếng Trung rải rác trong file Word.")
+                    st.info(f"🎯 Phát hiện {total_terms} từ/cụm từ tiếng Trung rải rác.")
                     
                     translation_dict = {}
                     total_batches = (total_terms + batch_terms_count - 1) // batch_terms_count
@@ -214,9 +212,8 @@ if uploaded_file:
                             time.sleep(delay_time)
 
                     if not translation_dict:
-                        st.error("❌ Không lấy được bản dịch từ Gemini. Vui lòng kiểm tra lại trạng thái API Keys.")
+                        st.error("❌ Không lấy được bản dịch. Vui lòng kiểm tra lại API Key!")
                     else:
-                        # Thay thế cụm từ vào từng đoạn
                         for p in target_paragraphs:
                             text_content = p.text
                             for cn_word, vi_word in translation_dict.items():
@@ -227,7 +224,7 @@ if uploaded_file:
                         doc.save(output_buffer)
                         output_buffer.seek(0)
                         
-                        st.success(f"🎉 Hoàn tất! Đã thay thế thành công {len(translation_dict)} từ tiếng Trung bị sót.")
+                        st.success(f"🎉 Hoàn tất! Đã thay thế thành công {len(translation_dict)} cụm từ bị sót.")
                         
                         st.download_button(
                             label="📥 Tải về File Word Đã Sửa (.docx)",
@@ -278,7 +275,7 @@ if uploaded_file:
                             time.sleep(delay_time)
 
                     if not translation_dict:
-                        st.error("❌ Không lấy được bản dịch từ Gemini. Vui lòng kiểm tra lại trạng thái API Keys.")
+                        st.error("❌ Không lấy được bản dịch. Vui lòng kiểm tra lại API Key!")
                     else:
                         for idx in target_indices:
                             line_content = lines[idx]
@@ -289,7 +286,7 @@ if uploaded_file:
 
                         result_txt = "\n".join(lines)
                         
-                        st.success(f"🎉 Hoàn tất! Đã thay thế thành công {len(translation_dict)} từ tiếng Trung bị sót.")
+                        st.success(f"🎉 Hoàn tất! Đã thay thế thành công {len(translation_dict)} cụm từ bị sót.")
                         
                         st.download_button(
                             label="📥 Tải về File TXT Đã Sửa (.txt)",
